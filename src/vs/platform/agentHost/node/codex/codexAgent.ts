@@ -155,6 +155,7 @@ import type { TurnCompletedNotification } from './protocol/generated/v2/TurnComp
 import type { TurnStartedNotification } from './protocol/generated/v2/TurnStartedNotification.js';
 import type { ItemStartedNotification } from './protocol/generated/v2/ItemStartedNotification.js';
 import type { ItemCompletedNotification } from './protocol/generated/v2/ItemCompletedNotification.js';
+import type { CollabAgentTool } from './protocol/generated/v2/CollabAgentTool.js';
 import type { TurnStartParams } from './protocol/generated/v2/TurnStartParams.js';
 import type { UserInput } from './protocol/generated/v2/UserInput.js';
 import type { ListMcpServerStatusResponse } from './protocol/generated/v2/ListMcpServerStatusResponse.js';
@@ -193,6 +194,8 @@ const CODEX_DESKTOP_ROLLOUT_PREFIX_CONCURRENCY = 8;
 const CODEX_COLD_SESSION_READ_CONCURRENCY = 8;
 const CODEX_THREAD_TURNS_PAGE_SIZE = 100;
 const CODEX_ON_DEMAND_CONNECTION_TIMEOUT_MS = 30_000;
+/** Collab calls that give an existing child more work; the child's next turns belong to the caller's current host turn. */
+const CODEX_CHILD_REUSE_TOOLS: ReadonlySet<CollabAgentTool> = new Set(['sendInput', 'resumeAgent', 'sendMessage', 'followupTask']);
 const CODEX_DESKTOP_WORKSPACE_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const CODEX_DESKTOP_SESSION_META_PATTERN = /"type"\s*:\s*"session_meta".*"payload"\s*:\s*\{[^}]*"originator"\s*:\s*"Codex Desktop"/s;
 const CODEX_GUARDIAN_TURN_INTERRUPTION_PREFIX = 'Automatic approval review rejected too many approval requests for this turn';
@@ -206,6 +209,11 @@ function isCodexWriterLockError(error: unknown, threadId: string | undefined): e
 function isCodexArchivedThreadError(error: unknown, threadId: string): error is JsonRpcError {
 	return error instanceof JsonRpcError && error.code === JsonRpcErrorCode.InvalidRequest
 		&& error.message.startsWith(`session ${threadId} is archived.`);
+}
+
+/** The physical paths a native file change touched, including a move's destination. */
+function fileChangePaths(item: Extract<ItemCompletedNotification['item'], { type: 'fileChange' }>): string[] {
+	return item.changes.flatMap(change => change.kind.type === 'update' && change.kind.move_path ? [change.path, change.kind.move_path] : [change.path]);
 }
 
 function isCodexDesktopGeneratedWorkspace(cwd: string, userHome: URI): boolean {
@@ -1196,6 +1204,8 @@ export class CodexAgent extends Disposable implements IAgent {
 	 * {@link _sessionIdByThreadId}. Removed on the child's `turn/completed`.
 	 */
 	private readonly _subagentsByThreadId = new Map<string, ICodexSubagent>();
+	/** Which parent session and host turn own a child thread's edits; outlives the child's subagent conversation, so a reused child keeps recording. */
+	private readonly _childTurnDiffOwners = new Map<string, { readonly parentSessionId: string; hostTurnId: string }>();
 	private readonly _mcpInventory = new CodexMcpInventory();
 	private readonly _mcpPublisherSessionIdByConfiguration = new Map<string, string>();
 	private readonly _publishedMcpTopLevelIdsByConfiguration = new Map<string, Set<string>>();
@@ -2729,8 +2739,14 @@ export class CodexAgent extends Disposable implements IAgent {
 			}
 		}));
 		subscriptions.add(client.onNotification('skills/changed', () => this._queueSkillHookCustomizationRefresh(client)));
-		subscriptions.add(client.onNotification('turn/started', params => this._dispatchByThread(params.threadId, s => this._handleTurnStartedNotification(s, params))));
-		subscriptions.add(client.onNotification('turn/diff/updated', params => this._dispatchByThread(params.threadId, s => this._handleTurnDiffUpdated(s, params))));
+		subscriptions.add(client.onNotification('turn/started', params => {
+			this._detachedChildTurnDiffs(params.threadId, params.turn.id);
+			this._dispatchByThread(params.threadId, s => this._handleTurnStartedNotification(s, params));
+		}));
+		subscriptions.add(client.onNotification('turn/diff/updated', params => {
+			this._detachedChildTurnDiffs(params.threadId, params.turnId)?.tracker.update(params);
+			this._dispatchByThread(params.threadId, s => this._handleTurnDiffUpdated(s, params));
+		}));
 		subscriptions.add(client.onNotification('item/started', params => this._dispatchByThread(params.threadId, s => this._handleItemStarted(s, params))));
 		subscriptions.add(client.onNotification('item/agentMessage/delta', params => this._dispatchByThread(params.threadId, s => mapAgentMessageDelta(s.mapState, this._withHostTurnId(s, params)))));
 		subscriptions.add(client.onNotification('item/commandExecution/outputDelta', params => this._dispatchByThread(params.threadId, s => mapCommandExecutionOutputDelta(s.mapState, this._withHostTurnId(s, params)))));
@@ -3222,6 +3238,36 @@ export class CodexAgent extends Disposable implements IAgent {
 		return subagent ? this._sessions.get(subagent.parentSessionId) : session;
 	}
 
+	/**
+	 * Tracks a turn of a child whose subagent conversation already completed, such as one
+	 * resumed by `send_input`, under the host turn of the collab call that gave it the work.
+	 */
+	private _detachedChildTurnDiffs(threadId: string, nativeTurnId: string): { readonly parent: ICodexSession; readonly tracker: CodexTurnDiffTracker } | undefined {
+		const owner = this._subagentsByThreadId.has(threadId) ? undefined : this._childTurnDiffOwners.get(threadId);
+		const parent = owner && this._sessions.get(owner.parentSessionId);
+		if (!owner || !parent || parent.disposed) {
+			return undefined;
+		}
+		const tracker = this._getTurnDiffTracker(parent);
+		tracker.start(threadId, nativeTurnId, owner.hostTurnId);
+		return { parent, tracker };
+	}
+
+	/** Moves a reused child's later edits to the caller's current host turn. */
+	private _bindReusedChildren(session: ICodexSession, params: ItemStartedNotification | ItemCompletedNotification): void {
+		if (params.item.type !== 'collabAgentToolCall' || !CODEX_CHILD_REUSE_TOOLS.has(params.item.tool)) {
+			return;
+		}
+		const caller = session.threadId ? this._subagentsByThreadId.get(session.threadId) : undefined;
+		const hostTurnId = caller?.hostTurnId ?? this._hostTurnId(session, params.turnId);
+		for (const threadId of params.item.receiverThreadIds) {
+			const owner = this._childTurnDiffOwners.get(threadId);
+			if (owner) {
+				owner.hostTurnId = hostTurnId;
+			}
+		}
+	}
+
 	private _getTurnDiffTracker(session: ICodexSession): CodexTurnDiffTracker {
 		let tracker = this._turnDiffs.get(session);
 		if (!tracker) {
@@ -3341,6 +3387,7 @@ export class CodexAgent extends Disposable implements IAgent {
 	 * other item kinds defer to {@link mapItemStarted}.
 	 */
 	private _handleItemStarted(session: ICodexSession, params: ItemStartedNotification): (SessionAction | ChatAction)[] {
+		this._bindReusedChildren(session, params);
 		if (params.item.type === 'userMessage') {
 			return this._handleSteeredUserMessage(session, params.item.content, params.item.clientId);
 		}
@@ -3787,6 +3834,9 @@ export class CodexAgent extends Disposable implements IAgent {
 		const sessionId = this._sessionIdByThreadId.get(params.threadId);
 		const session = sessionId ? this._sessions.get(sessionId) : undefined;
 		if (!session) {
+			if (params.item.type === 'fileChange' && params.item.status === 'completed') {
+				this._detachedChildTurnDiffs(params.threadId, params.turnId)?.tracker.markEdited(params.turnId, fileChangePaths(params.item));
+			}
 			this._logService.trace(`[Codex] Ignoring item/completed for untracked threadId=${params.threadId}; likely unclaimed prewarm`);
 			return;
 		}
@@ -3795,6 +3845,7 @@ export class CodexAgent extends Disposable implements IAgent {
 		// may clear), and firing `subagent_started` first lets the orchestrator
 		// attach the child-conversation block to the still-open parent tool call.
 		this._maybeRegisterSubagents(session, params);
+		this._bindReusedChildren(session, params);
 		this._recordTurnFileChanges(session, params);
 		const retainedOutputResource = this._retainCommandOutput(session, params.item);
 		const actions = mapItemCompleted(session.mapState, this._withHostTurnId(session, params), retainedOutputResource);
@@ -3813,8 +3864,7 @@ export class CodexAgent extends Disposable implements IAgent {
 			const tracker = this._getTurnDiffTracker(owner);
 			const child = this._subagentsByThreadId.get(params.threadId);
 			tracker.start(params.threadId, params.turnId, child?.hostTurnId ?? this._hostTurnId(session, params.turnId));
-			tracker.markEdited(params.turnId, params.item.changes.flatMap(change => change.kind.type === 'update' && change.kind.move_path
-				? [change.path, change.kind.move_path] : [change.path]));
+			tracker.markEdited(params.turnId, fileChangePaths(params.item));
 		}
 	}
 
@@ -3889,6 +3939,10 @@ export class CodexAgent extends Disposable implements IAgent {
 			});
 			return;
 		}
+		const detached = this._detachedChildTurnDiffs(params.threadId, params.turn.id);
+		if (detached) {
+			this._stageTurnDiff(detached.parent, params.turn.id, detached.parent);
+		}
 		this._dispatchByThread(params.threadId, s => {
 			this._stageTurnDiff(s, params.turn.id);
 			return this._handleTurnCompletedNotification(s, params);
@@ -3922,7 +3976,9 @@ export class CodexAgent extends Disposable implements IAgent {
 			const subSession = this._createSubagentSession(session, childThreadId);
 			const spawningChild = session.threadId ? this._subagentsByThreadId.get(session.threadId) : undefined;
 			const hostTurnId = spawningChild?.hostTurnId ?? this._hostTurnId(session, params.turnId);
-			this._getTurnDiffTracker(this._turnDiffOwner(session) ?? session).trackChild(childThreadId, hostTurnId);
+			const owner = this._turnDiffOwner(session) ?? session;
+			this._getTurnDiffTracker(owner).trackChild(childThreadId, hostTurnId);
+			this._childTurnDiffOwners.set(childThreadId, { parentSessionId: owner.sessionId, hostTurnId });
 			this._subagentsByThreadId.set(childThreadId, {
 				parentSessionId: session.sessionId,
 				toolCallId: entry.toolCallId,
@@ -4385,6 +4441,14 @@ export class CodexAgent extends Disposable implements IAgent {
 			const parent = this._sessions.get(subagent.parentSessionId);
 			if (parent && subagent.session.threadId) {
 				void this._turnDiffs.get(parent)?.completeThread(subagent.session.threadId).catch(error => {
+					this._logService.warn('[Codex] Failed to capture child edits on disconnect', error);
+				});
+			}
+		}
+		for (const [threadId, owner] of this._childTurnDiffOwners) {
+			const parent = this._subagentsByThreadId.has(threadId) ? undefined : this._sessions.get(owner.parentSessionId);
+			if (parent) {
+				void this._turnDiffs.get(parent)?.completeThread(threadId).catch(error => {
 					this._logService.warn('[Codex] Failed to capture child edits on disconnect', error);
 				});
 			}
@@ -6790,6 +6854,11 @@ export class CodexAgent extends Disposable implements IAgent {
 				this._subagentsByThreadId.delete(childThreadId);
 			}
 		}
+		for (const [childThreadId, owner] of this._childTurnDiffOwners) {
+			if (owner.parentSessionId === sessionId) {
+				this._childTurnDiffOwners.delete(childThreadId);
+			}
+		}
 		const conn = this._connection;
 		if (conn.kind === 'ready' && session.threadId !== undefined) {
 			const threadId = session.threadId;
@@ -8922,6 +8991,7 @@ export class CodexAgent extends Disposable implements IAgent {
 		this._configScopeChats.clear();
 		this._configScopeByChat.clear();
 		this._subagentsByThreadId.clear();
+		this._childTurnDiffOwners.clear();
 		this._sessionMcpDiscoveries.clear();
 		this._pendingMcpStartupStatuses.clear();
 		this._mcpInventory.clear();
