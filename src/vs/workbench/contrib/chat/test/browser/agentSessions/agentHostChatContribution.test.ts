@@ -17697,6 +17697,7 @@ suite('AgentHostChatContribution', () => {
 				onDidChangePendingRequests: Event.None,
 				getPendingRequests: () => [],
 				getRequests: () => [upcastPartial<IChatRequestModel>({ id: serverTurnId, response })],
+				startEditingSession: () => { },
 			}));
 
 			agentHostService.fireAction({
